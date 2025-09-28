@@ -1,0 +1,7 @@
+streamlit>=1.30
+pandas>=2.0
+geopy>=2.4
+pydeck>=0.8
+openpyxl>=3.1
+xlrd>=2.0
+requests>=2.31
