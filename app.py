@@ -1,10 +1,14 @@
 # -*- coding: utf-8 -*-
-# App Streamlit: subir clientes + endereços, visualizar no mapa, traçar rota e exportar GeoJSON
+# App Streamlit: subir clientes + endereços, visualizar no mapa, traçar rota com ponto de partida/destino e exportar GeoJSON/KML/KMZ
 # Autor: Você :)
 # Observação: comentários e rótulos em PT-BR para facilitar manutenção
 
 import math
 import json
+import io
+import zipfile
+from html import escape
+
 import pandas as pd
 import streamlit as st
 from typing import Optional, Tuple, List
@@ -23,12 +27,12 @@ import requests
 # ==============================
 # Configuração da Página
 # ==============================
-st.set_page_config(page_title="Clientes no Mapa + Rotas + GeoJSON", layout="wide")
+st.set_page_config(page_title="Clientes no Mapa + Rotas + GeoJSON/KML", layout="wide")
 
-st.title("📍 Clientes no Mapa + 🛣️ Rotas + 🌐 GeoJSON")
+st.title("📍 Clientes no Mapa + 🛣️ Rotas + 🌐 GeoJSON/KML")
 st.caption(
     "Envie uma planilha (CSV/XLSX) com **Cliente** e **Endereço**, geocodifique, visualize no mapa, "
-    "trace uma rota (linhas retas ou OSRM) e exporte **GeoJSON**."
+    "defina **ponto de partida** e **ponto de destino**, trace rota (linhas retas ou OSRM) e exporte **GeoJSON/KML/KMZ**."
 )
 
 # ==============================
@@ -38,14 +42,29 @@ def _init_state():
     if "df_geo" not in st.session_state:
         st.session_state.df_geo = None
     if "route" not in st.session_state:
-        st.session_state.route = None  # dict com: coords_lonlat, ordem_df, distancia_km, duracao_min, perfil, fechar
+        # dict: coords_lonlat, ordem_df, distancia_km, duracao_min, perfil, fechar, partida, destino
+        st.session_state.route = None
+    if "start" not in st.session_state:
+        # dict: {"lat": float, "lon": float, "label": str}
+        st.session_state.start = None
+    if "end" not in st.session_state:
+        # dict: {"lat": float, "lon": float, "label": str}
+        st.session_state.end = None
 
 def reset_geocoded():
     st.session_state.df_geo = None
     st.session_state.route = None
+    st.session_state.start = None
+    st.session_state.end = None
 
 def reset_route():
     st.session_state.route = None
+
+def reset_start():
+    st.session_state.start = None
+
+def reset_end():
+    st.session_state.end = None
 
 _init_state()
 
@@ -210,16 +229,14 @@ def haversine_km(lat1, lon1, lat2, lon2) -> float:
     return 2 * R * math.asin(math.sqrt(a))
 
 
-def rota_distancia_km(coords: List[Tuple[float, float]], ordem: List[int], fechar: bool) -> float:
-    """Distância total (km) para a ordem fornecida em coords=[(lat,lon), ...]."""
+def rota_distancia_clientes_km(coords: List[Tuple[float, float]], ordem: List[int]) -> float:
+    """Distância total (km) apenas ENTRE os clientes na ordem (rota aberta)."""
     if len(ordem) < 2:
         return 0.0
     dist = 0.0
     for i in range(len(ordem) - 1):
         a, b = ordem[i], ordem[i+1]
         dist += haversine_km(coords[a][0], coords[a][1], coords[b][0], coords[b][1])
-    if fechar and len(ordem) > 2:
-        dist += haversine_km(coords[ordem[-1]][0], coords[ordem[-1]][1], coords[ordem[0]][0], coords[ordem[0]][1])
     return dist
 
 
@@ -241,7 +258,7 @@ def nearest_neighbor_order(coords: List[Tuple[float, float]], start_index: int =
 
 
 def two_opt(coords: List[Tuple[float, float]], ordem: List[int], max_iter: int = 200) -> List[int]:
-    """Melhora a ordem (rota aberta) usando 2-opt básico."""
+    """Melhora a ordem (rota aberta) usando 2-opt básico mantendo o primeiro fixo."""
     if len(ordem) < 4:
         return ordem[:]
     best = ordem[:]
@@ -250,7 +267,7 @@ def two_opt(coords: List[Tuple[float, float]], ordem: List[int], max_iter: int =
     while improved and iter_count < max_iter:
         improved = False
         iter_count += 1
-        for i in range(1, len(best) - 2):
+        for i in range(1, len(best) - 2):  # começa em 1 para manter início fixo
             for j in range(i + 1, len(best) - 1):
                 a, b = best[i - 1], best[i]
                 c, d = best[j], best[j + 1]
@@ -268,17 +285,24 @@ def two_opt(coords: List[Tuple[float, float]], ordem: List[int], max_iter: int =
     return best
 
 
-def construir_ordem(coords: List[Tuple[float, float]], metodo: str) -> List[int]:
-    """Constroi ordem conforme método."""
-    if not coords:
+def construir_ordem(coords: List[Tuple[float, float]], metodo: str, start_index: int = 0) -> List[int]:
+    """Constroi ordem conforme método e ponto de partida (start_index)."""
+    n = len(coords)
+    if n == 0:
         return []
+    start_index = int(start_index) if 0 <= int(start_index) < n else 0
+
     if metodo == "Pela ordem do arquivo":
-        return list(range(len(coords)))
+        ordem = list(range(n))
+        # rotaciona para começar no start_index
+        if start_index > 0:
+            ordem = ordem[start_index:] + ordem[:start_index]
+        return ordem
     elif metodo == "Otimizar (Vizinho + 2-opt)":
-        nn = nearest_neighbor_order(coords, start_index=0)
-        return two_opt(coords, nn, max_iter=200)
+        nn = nearest_neighbor_order(coords, start_index=start_index)  # já começa no start_index
+        return two_opt(coords, nn, max_iter=200)                      # mantém início fixo
     else:
-        return list(range(len(coords)))
+        return list(range(n))
 
 
 # ==============================
@@ -307,7 +331,7 @@ def osrm_route(coords: List[Tuple[float, float]], profile: str = "driving"):
 
 
 # ==============================
-# GeoJSON: LineString (rota) + Points (waypoints)
+# GeoJSON: LineString (rota) + Points (waypoints + partida/destino)
 # ==============================
 def montar_geojson_rota(
     route_coords_lonlat,
@@ -316,11 +340,15 @@ def montar_geojson_rota(
     duracao_min: Optional[float] = None,
     profile: Optional[str] = None,
     fechar_rota: bool = False,
+    ponto_partida: Optional[dict] = None,   # {"lat": float, "lon": float, "label": str}
+    ponto_destino: Optional[dict] = None,   # {"lat": float, "lon": float, "label": str}
 ) -> str:
     """
     Monta um FeatureCollection GeoJSON com:
       - 1 LineString: a rota (coordinates em [lon, lat])
       - N Points: waypoints na ordem da rota
+      - 1 Point opcional: partida
+      - 1 Point opcional: destino
     """
     features = []
 
@@ -334,12 +362,38 @@ def montar_geojson_rota(
                 "profile": profile,
                 "fechar_rota": fechar_rota,
             },
-            "geometry": {
-                "type": "LineString",
-                "coordinates": route_coords_lonlat  # [[lon, lat], ...]
-            }
+            "geometry": {"type": "LineString", "coordinates": route_coords_lonlat}
         })
 
+    # Partida
+    if ponto_partida and "lat" in ponto_partida and "lon" in ponto_partida:
+        try:
+            plat = float(ponto_partida["lat"])
+            plon = float(ponto_partida["lon"])
+            plabel = str(ponto_partida.get("label", "Partida"))
+            features.append({
+                "type": "Feature",
+                "properties": {"tipo": "partida", "nome": plabel},
+                "geometry": {"type": "Point", "coordinates": [plon, plat]}
+            })
+        except Exception:
+            pass
+
+    # Destino
+    if ponto_destino and "lat" in ponto_destino and "lon" in ponto_destino:
+        try:
+            dlat = float(ponto_destino["lat"])
+            dlon = float(ponto_destino["lon"])
+            dlabel = str(ponto_destino.get("label", "Destino"))
+            features.append({
+                "type": "Feature",
+                "properties": {"tipo": "destino", "nome": dlabel},
+                "geometry": {"type": "Point", "coordinates": [dlon, dlat]}
+            })
+        except Exception:
+            pass
+
+    # Pontos dos clientes
     for ordem_idx, row in pontos_ordem_df.reset_index(drop=True).iterrows():
         try:
             lat = float(row["lat"])
@@ -355,18 +409,131 @@ def montar_geojson_rota(
                 "endereco": str(row.get("endereco", "")),
                 "status": str(row.get("status", "")),
             },
-            "geometry": {
-                "type": "Point",
-                "coordinates": [lon, lat]
-            }
+            "geometry": {"type": "Point", "coordinates": [lon, lat]}
         })
 
     fc = {"type": "FeatureCollection", "features": features}
     return json.dumps(fc, ensure_ascii=False, indent=2)
 
 
-def mostrar_mapa(df_geo: pd.DataFrame, route_coords_lonlat: Optional[List[List[float]]] = None):
-    """Renderiza os pontos e, opcionalmente, a rota no mapa usando pydeck."""
+# ==============================
+# KML/KMZ: LineString (rota) + Placemarks (waypoints + partida/destino)
+# ==============================
+def montar_kml_rota(
+    route_coords_lonlat,
+    pontos_ordem_df: pd.DataFrame,
+    distancia_km: Optional[float] = None,
+    duracao_min: Optional[float] = None,
+    profile: Optional[str] = None,
+    fechar_rota: bool = False,
+    ponto_partida: Optional[dict] = None,   # {"lat": float, "lon": float, "label": str}
+    ponto_destino: Optional[dict] = None,   # {"lat": float, "lon": float, "label": str}
+) -> str:
+    """
+    Gera um KML (texto) com:
+      - LineString da rota (se houver)
+      - Ponto de partida (se houver)
+      - Ponto de destino (se houver)
+      - Pontos dos clientes na ordem
+    """
+    def _fmt(v, nd=6):
+        try:
+            return f"{float(v):.{nd}f}"
+        except Exception:
+            return ""
+
+    # Cabeçalho e estilos (KML usa cor ARGB em hex: aabbggrr)
+    parts = [
+        '<?xml version="1.0" encoding="UTF-8"?>',
+        '<kml xmlns="http://www.opengis.net/kml/2.2">',
+        "<Document>",
+        "<name>Rota de Clientes</name>",
+        "<description><![CDATA[",
+        f"Perfil: {escape(str(profile or 'geodesic'))} | "
+        f"Distância: {'' if distancia_km is None else f'{distancia_km:.2f} km'} | "
+        f"Duração: {'' if duracao_min is None else f'{duracao_min:.1f} min'} | "
+        f"Rota fechada: {'Sim' if fechar_rota else 'Não'}",
+        "]]></description>",
+        # Estilo da rota (vermelho semi-transparente)
+        '<Style id="routeStyle"><LineStyle><color>990000ff</color><width>4</width></LineStyle></Style>',
+        # Estilo dos pontos (clientes) – laranja
+        '<Style id="pointStyle"><IconStyle><color>ff0099FF</color></IconStyle></Style>',
+        # Estilo do ponto de partida – verde
+        '<Style id="startStyle"><IconStyle><color>ff00cc00</color></IconStyle></Style>',
+        # Estilo do ponto de destino – roxo
+        '<Style id="endStyle"><IconStyle><color>ff9900ff</color></IconStyle></Style>',
+    ]
+
+    # Partida
+    if ponto_partida and "lat" in ponto_partida and "lon" in ponto_partida:
+        plat, plon = ponto_partida["lat"], ponto_partida["lon"]
+        plabel = escape(str(ponto_partida.get("label", "Partida")))
+        parts += [
+            "<Placemark>",
+            f"<name>{plabel}</name>",
+            "<styleUrl>#startStyle</styleUrl>",
+            "<Point>",
+            f"<coordinates>{_fmt(plon)},{_fmt(plat)},0</coordinates>",
+            "</Point>",
+            "</Placemark>",
+        ]
+
+    # Destino
+    if ponto_destino and "lat" in ponto_destino and "lon" in ponto_destino:
+        dlat, dlon = ponto_destino["lat"], ponto_destino["lon"]
+        dlabel = escape(str(ponto_destino.get("label", "Destino")))
+        parts += [
+            "<Placemark>",
+            f"<name>{dlabel}</name>",
+            "<styleUrl>#endStyle</styleUrl>",
+            "<Point>",
+            f"<coordinates>{_fmt(dlon)},{_fmt(dlat)},0</coordinates>",
+            "</Point>",
+            "</Placemark>",
+        ]
+
+    # Pontos dos clientes (na ordem)
+    for idx, row in pontos_ordem_df.reset_index(drop=True).iterrows():
+        try:
+            lat = float(row["lat"]); lon = float(row["lon"])
+        except Exception:
+            continue
+        nome = escape(f"{idx+1:02d} — {str(row.get('cliente',''))}")
+        desc = escape(str(row.get("endereco", "")))
+        parts += [
+            "<Placemark>",
+            f"<name>{nome}</name>",
+            "<styleUrl>#pointStyle</styleUrl>",
+            "<description><![CDATA[",
+            f"{desc}",
+            "]]></description>",
+            "<Point>",
+            f"<coordinates>{_fmt(lon)},{_fmt(lat)},0</coordinates>",
+            "</Point>",
+            "</Placemark>",
+        ]
+
+    # LineString da rota (se houver)
+    if route_coords_lonlat and len(route_coords_lonlat) >= 2:
+        coords_str = " ".join([f"{_fmt(lon)},{_fmt(lat)},0" for lon, lat in route_coords_lonlat])
+        parts += [
+            "<Placemark>",
+            "<name>Rota</name>",
+            "<styleUrl>#routeStyle</styleUrl>",
+            "<LineString>",
+            "<tessellate>1</tessellate>",
+            f"<coordinates>{coords_str}</coordinates>",
+            "</LineString>",
+            "</Placemark>",
+        ]
+
+    parts += ["</Document>", "</kml>"]
+    return "\n".join(parts)
+
+
+def mostrar_mapa(df_geo: pd.DataFrame, route_coords_lonlat: Optional[List[List[float]]] = None,
+                 partida: Optional[dict] = None, destino: Optional[dict] = None):
+    """Renderiza os pontos e, opcionalmente, a rota e os pontos de partida/destino no mapa usando pydeck."""
     pontos = df_geo.dropna(subset=["lat", "lon"]).copy()
     if pontos.empty:
         st.warning("Nenhum ponto válido para plotar no mapa.")
@@ -377,6 +544,7 @@ def mostrar_mapa(df_geo: pd.DataFrame, route_coords_lonlat: Optional[List[List[f
 
     layers = []
 
+    # Pontos dos clientes
     layer_points = pdk.Layer(
         "ScatterplotLayer",
         data=pontos,
@@ -387,6 +555,7 @@ def mostrar_mapa(df_geo: pd.DataFrame, route_coords_lonlat: Optional[List[List[f
     )
     layers.append(layer_points)
 
+    # Rota
     if route_coords_lonlat and len(route_coords_lonlat) >= 2:
         path_data = [{"path": route_coords_lonlat, "name": "Rota"}]
         layer_route = pdk.Layer(
@@ -399,6 +568,32 @@ def mostrar_mapa(df_geo: pd.DataFrame, route_coords_lonlat: Optional[List[List[f
             pickable=False,
         )
         layers.append(layer_route)
+
+    # Ponto de partida (se houver)
+    if partida and "lat" in partida and "lon" in partida:
+        partida_df = pd.DataFrame([{"lat": partida["lat"], "lon": partida["lon"], "label": partida.get("label", "Partida")}])
+        layer_start = pdk.Layer(
+            "ScatterplotLayer",
+            data=partida_df,
+            get_position="[lon, lat]",
+            get_fill_color=[0, 180, 0, 220],  # verde
+            get_radius=120,
+            pickable=True,
+        )
+        layers.append(layer_start)
+
+    # Ponto de destino (se houver)
+    if destino and "lat" in destino and "lon" in destino:
+        destino_df = pd.DataFrame([{"lat": destino["lat"], "lon": destino["lon"], "label": destino.get("label", "Destino")}])
+        layer_end = pdk.Layer(
+            "ScatterplotLayer",
+            data=destino_df,
+            get_position="[lon, lat]",
+            get_fill_color=[170, 0, 255, 220],  # roxo
+            get_radius=120,
+            pickable=True,
+        )
+        layers.append(layer_end)
 
     tooltip = {
         "html": "<b>Cliente:</b> {cliente}<br/><b>Endereço:</b> {endereco}<br/><b>Status:</b> {status}",
@@ -440,15 +635,23 @@ with st.sidebar:
         )
 
     st.divider()
-    col_a, col_b = st.columns(2)
+    col_a, col_b, col_c, col_d = st.columns(4)
     with col_a:
         if st.button("🧹 Limpar cache de geocodificação"):
             st.cache_data.clear()
             st.success("Cache limpo!")
     with col_b:
-        if st.button("♻️ Limpar resultados (geocodificação/rota)"):
+        if st.button("♻️ Limpar resultados"):
             reset_geocoded()
             st.success("Resultados limpos!")
+    with col_c:
+        if st.button("🧭 Limpar partida"):
+            reset_start()
+            st.success("Ponto de partida limpo!")
+    with col_d:
+        if st.button("🏁 Limpar destino"):
+            reset_end()
+            st.success("Ponto de destino limpo!")
 
 
 st.divider()
@@ -492,9 +695,7 @@ if arquivo:
         st.error("Selecione **colunas diferentes** para Cliente e Endereço.")
         st.stop()
 
-    # -------------------------------
     # Botão: Geocodificar (salva no state)
-    # -------------------------------
     if st.button("Geocodificar e Mostrar no Mapa", type="primary", key="btn_geocodificar"):
         with st.spinner("Processando endereços..."):
             df_geo = geocodificar_dataframe(
@@ -507,18 +708,17 @@ if arquivo:
                 language=language,
                 user_agent_email=user_agent_email or None,
             )
-        st.session_state.df_geo = df_geo  # <- PERSISTE RESULTADO
-        st.session_state.route = None     # limpa rota anterior
-        st.success("Geocodificação concluída! Role a página para a seção de rotas.")
+        st.session_state.df_geo = df_geo
+        st.session_state.route = None
+        st.success("Geocodificação concluída! Role até a seção de rotas.")
 
 # ==============================
 # Se existe geocodificação salva, mostra resultados e permite rotas
-# (Fora do if do botão, para persistir após rerun)
 # ==============================
 if st.session_state.df_geo is not None:
     df_geo = st.session_state.df_geo
 
-    # Métricas de qualidade
+    # Métricas
     total = len(df_geo)
     ok = (df_geo["status"] == "OK").sum()
     not_found = (df_geo["status"] == "Não encontrado").sum()
@@ -532,7 +732,7 @@ if st.session_state.df_geo is not None:
     m4.metric("Vazios/Erros", f"{(vazios + max(erros, 0)):,}")
 
     # ==============================
-    # Seção: Rotas (sempre visível quando df_geo existe)
+    # Seção: Rotas
     # ==============================
     st.subheader("🛣️ Rota entre clientes (opcional)")
 
@@ -541,13 +741,101 @@ if st.session_state.df_geo is not None:
         st.info("São necessários pelo menos **2** pontos geocodificados para traçar uma rota.")
         mostrar_mapa(df_geo)
     else:
-        # Controles de rota (fora de forms para simplificar; usamos session_state para resultados)
+        # ---- Ponto de partida ----
+        st.markdown("**Ponto de partida**")
+        colp1, colp2, colp3 = st.columns([1.2, 1, 1])
+        with colp1:
+            modo_partida = st.selectbox(
+                "Escolha a origem",
+                options=["Primeiro cliente", "Selecionar cliente da lista", "Endereço fixo (novo)"],
+                index=0,
+                help="Defina de onde a rota começa."
+            )
+        start_index = 0
+        if modo_partida == "Selecionar cliente da lista":
+            opcoes_idx = list(pontos_validos.index)
+            def _fmt_start(i): 
+                return f"{pontos_validos.loc[i,'cliente']} — {pontos_validos.loc[i,'endereco']}"
+            with colp2:
+                start_idx_sel = st.selectbox("Cliente de partida", options=opcoes_idx, format_func=_fmt_start)
+                start_index = int(pontos_validos.index.get_loc(start_idx_sel))
+        elif modo_partida == "Endereço fixo (novo)":
+            with colp2:
+                start_address = st.text_input("Endereço de partida (fixo)", placeholder="Ex.: Rua X, 123 - Cidade/UF, BR")
+            with colp3:
+                if st.button("Geocodificar partida", help="Geocodifica e salva este endereço como ponto de partida."):
+                    if not start_address.strip():
+                        st.warning("Informe um endereço de partida.")
+                    else:
+                        plat, plon, pstatus = geocodificar_endereco_cache(
+                            endereco=start_address.strip(),
+                            provedor=provedor,
+                            api_key=api_key,
+                            country_bias=country_bias,
+                            language=language,
+                            user_agent_email=user_agent_email or None,
+                        )
+                        if pstatus == "OK":
+                            st.session_state.start = {"lat": float(plat), "lon": float(plon), "label": start_address.strip()}
+                            st.success("Ponto de partida salvo!")
+                        else:
+                            st.error(f"Não foi possível geocodificar a partida: {pstatus}")
+        # Exibe partida salva (se houver)
+        if st.session_state.start:
+            st.info(f"Partida fixa: **{st.session_state.start.get('label','(sem nome)')}** "
+                    f"({st.session_state.start['lat']:.6f}, {st.session_state.start['lon']:.6f})")
+
+        # ---- Ponto de destino ----
+        st.markdown("**Ponto de destino**")
+        cold1, cold2, cold3 = st.columns([1.2, 1, 1])
+        with cold1:
+            modo_destino = st.selectbox(
+                "Escolha o destino",
+                options=["Último cliente", "Selecionar cliente da lista", "Endereço fixo (novo)"],
+                index=0,
+                help="Defina onde a rota termina."
+            )
+        end_index = None  # índice (0..n-1) do cliente destino, se selecionado
+        if modo_destino == "Selecionar cliente da lista":
+            opcoes_idx_d = list(pontos_validos.index)
+            def _fmt_end(i): 
+                return f"{pontos_validos.loc[i,'cliente']} — {pontos_validos.loc[i,'endereco']}"
+            with cold2:
+                end_idx_sel = st.selectbox("Cliente de destino", options=opcoes_idx_d, format_func=_fmt_end)
+                end_index = int(pontos_validos.index.get_loc(end_idx_sel))
+        elif modo_destino == "Endereço fixo (novo)":
+            with cold2:
+                end_address = st.text_input("Endereço de destino (fixo)", placeholder="Ex.: Rua Y, 999 - Cidade/UF, BR")
+            with cold3:
+                if st.button("Geocodificar destino", help="Geocodifica e salva este endereço como ponto de destino."):
+                    if not end_address.strip():
+                        st.warning("Informe um endereço de destino.")
+                    else:
+                        dlat, dlon, dstatus = geocodificar_endereco_cache(
+                            endereco=end_address.strip(),
+                            provedor=provedor,
+                            api_key=api_key,
+                            country_bias=country_bias,
+                            language=language,
+                            user_agent_email=user_agent_email or None,
+                        )
+                        if dstatus == "OK":
+                            st.session_state.end = {"lat": float(dlat), "lon": float(dlon), "label": end_address.strip()}
+                            st.success("Ponto de destino salvo!")
+                        else:
+                            st.error(f"Não foi possível geocodificar o destino: {dstatus}")
+        # Exibe destino salvo (se houver)
+        if st.session_state.end:
+            st.info(f"Destino fixo: **{st.session_state.end.get('label','(sem nome)')}** "
+                    f"({st.session_state.end['lat']:.6f}, {st.session_state.end['lon']:.6f})")
+
+        # ---- Opções de rota ----
         col1, col2, col3 = st.columns(3)
         with col1:
             metodo_ordem = st.selectbox(
                 "Método de ordenação",
                 options=["Pela ordem do arquivo", "Otimizar (Vizinho + 2-opt)"],
-                help="Escolha como a ordem dos clientes será definida.",
+                help="Como a ordem dos clientes será definida.",
                 key="opt_metodo_ordem"
             )
         with col2:
@@ -556,7 +844,7 @@ if st.session_state.df_geo is not None:
             motor_rota = st.selectbox(
                 "Motor de rota",
                 options=["Linhas retas (sem API)", "OSRM público (gratuito)"],
-                help="OSRM retorna distância e tempo reais; Linhas retas estimam distância geodésica.",
+                help="OSRM retorna distância/tempo reais; Linhas retas estimam distância geodésica.",
                 key="opt_motor"
             )
 
@@ -572,13 +860,36 @@ if st.session_state.df_geo is not None:
                 reset_route()
                 st.info("Rota limpa.")
 
-        # Se clicar em gerar, calcula e SALVA no session_state.route
+        # ---- Geração da rota (salva no session_state.route) ----
         if gerar:
             coords = [(float(lat), float(lon)) for lat, lon in zip(pontos_validos["lat"], pontos_validos["lon"])]
-            ordem = construir_ordem(coords, metodo_ordem)
-            coords_ordenadas = [coords[i] for i in ordem]
-            if fechar_rota and len(coords_ordenadas) >= 2:
-                coords_ordenadas.append(coords_ordenadas[0])
+
+            # Ordem de visita começando no start_index (se partida é cliente)
+            ordem = construir_ordem(coords, metodo_ordem, start_index=start_index)
+
+            # Se destino é um cliente específico, garante que ele seja o último (sem duplicar)
+            if modo_destino == "Selecionar cliente da lista" and end_index is not None:
+                if end_index in ordem and end_index != ordem[-1]:
+                    # remove da posição atual e envia para o fim (mantém start em primeiro)
+                    ordem.remove(end_index)
+                    ordem.append(end_index)
+
+            # Coordenadas dos clientes na ordem
+            coords_ordenadas_clientes = [coords[i] for i in ordem]
+
+            # Partida/destino externos (endereços fixos)
+            start_external = st.session_state.start if (modo_partida == "Endereço fixo (novo)" and st.session_state.start) else None
+            end_external = st.session_state.end if (modo_destino == "Endereço fixo (novo)" and st.session_state.end) else None
+
+            # Monta a sequência que irá para o motor de rota
+            coords_para_rota = coords_ordenadas_clientes[:]
+            if start_external:
+                coords_para_rota = [(start_external["lat"], start_external["lon"])] + coords_para_rota
+            if end_external:
+                coords_para_rota = coords_para_rota + [(end_external["lat"], end_external["lon"])]
+
+            if fechar_rota and len(coords_para_rota) >= 2:
+                coords_para_rota = coords_para_rota + [coords_para_rota[0]]
 
             route_coords_lonlat = None
             distancia_km_aprox = None
@@ -586,22 +897,55 @@ if st.session_state.df_geo is not None:
 
             try:
                 if motor_rota == "OSRM público (gratuito)":
-                    geometry, dist_m, dur_s = osrm_route(coords_ordenadas, profile=perfil_osrm)
+                    geometry, dist_m, dur_s = osrm_route(coords_para_rota, profile=perfil_osrm)
                     route_coords_lonlat = geometry
                     distancia_km_aprox = (dist_m / 1000.0) if dist_m is not None else None
                     duracao_min = (dur_s / 60.0) if dur_s is not None else None
                 else:
-                    route_coords_lonlat = [[lon, lat] for (lat, lon) in coords_ordenadas]
-                    distancia_km_aprox = rota_distancia_km(coords, ordem, fechar_rota)
+                    # Linhas retas: polyline de tudo que será percorrido
+                    route_coords_lonlat = [[lon, lat] for (lat, lon) in coords_para_rota]
+
+                    # Distância aproximada:
+                    # 1) entre clientes (rota aberta entre eles)
+                    distancia_km_aprox = rota_distancia_clientes_km(coords, ordem)
+
+                    # 2) add partida externa -> primeiro cliente
+                    if start_external and len(coords_ordenadas_clientes) >= 1:
+                        distancia_km_aprox += haversine_km(
+                            start_external["lat"], start_external["lon"],
+                            coords_ordenadas_clientes[0][0], coords_ordenadas_clientes[0][1],
+                        )
+
+                    # 3) add último cliente -> destino externo
+                    if end_external and len(coords_ordenadas_clientes) >= 1:
+                        distancia_km_aprox += haversine_km(
+                            coords_ordenadas_clientes[-1][0], coords_ordenadas_clientes[-1][1],
+                            end_external["lat"], end_external["lon"],
+                        )
+
+                    # 4) fechamento (fecha no primeiro da sequência usada no traçado)
+                    if fechar_rota:
+                        if start_external:
+                            first_lat, first_lon = start_external["lat"], start_external["lon"]
+                        else:
+                            first_lat, first_lon = coords_ordenadas_clientes[0]
+                        if end_external:
+                            last_lat, last_lon = end_external["lat"], end_external["lon"]
+                        else:
+                            last_lat, last_lon = coords_ordenadas_clientes[-1]
+                        distancia_km_aprox += haversine_km(last_lat, last_lon, first_lat, first_lon)
+
                     duracao_min = None
             except Exception as e:
                 st.error(f"Falha ao calcular a rota: {e}")
                 route_coords_lonlat = None
 
+            # Tabela ordem (somente clientes na ordem)
             ordem_df = pontos_validos.iloc[ordem].copy().reset_index(drop=True)
             ordem_df.index = ordem_df.index + 1
             ordem_df.rename_axis("Ordem", inplace=True)
 
+            # Salva no estado
             st.session_state.route = {
                 "coords_lonlat": route_coords_lonlat,
                 "ordem_df": ordem_df,
@@ -609,13 +953,20 @@ if st.session_state.df_geo is not None:
                 "duracao_min": duracao_min,
                 "perfil": (perfil_osrm if motor_rota == "OSRM público (gratuito)" else "geodesic"),
                 "fechar_rota": fechar_rota,
+                "partida": start_external,   # None se partida for cliente
+                "destino": end_external,     # None se destino for cliente
             }
             st.success("Rota gerada! Role para ver o mapa e os downloads.")
 
-        # Renderização baseada no que está salvo em session_state.route
+        # ---- Renderização com base no estado salvo ----
         route_state = st.session_state.route
         if route_state and route_state.get("coords_lonlat"):
-            mostrar_mapa(pontos_validos, route_coords_lonlat=route_state["coords_lonlat"])
+            mostrar_mapa(
+                pontos_validos,
+                route_coords_lonlat=route_state["coords_lonlat"],
+                partida=route_state.get("partida"),
+                destino=route_state.get("destino"),
+            )
 
             st.subheader("Ordem dos clientes na rota")
             ordem_df = route_state["ordem_df"]
@@ -628,7 +979,7 @@ if st.session_state.df_geo is not None:
                 colm2.metric("Tempo estimado", f"{route_state['duracao_min']:,.1f} min")
             colm3.metric("Pontos na rota", f"{len(ordem_df)}")
 
-            # Downloads
+            # Downloads: CSV (ordem)
             csv_ordem = ordem_df.reset_index().rename(columns={"index": "Ordem"}).to_csv(index=False).encode("utf-8")
             st.download_button(
                 "⬇️ Baixar CSV com a ordem da rota",
@@ -637,6 +988,7 @@ if st.session_state.df_geo is not None:
                 mime="text/csv",
             )
 
+            # Downloads: GeoJSON
             try:
                 geojson_str = montar_geojson_rota(
                     route_coords_lonlat=route_state["coords_lonlat"],
@@ -645,19 +997,57 @@ if st.session_state.df_geo is not None:
                     duracao_min=route_state.get("duracao_min"),
                     profile=route_state.get("perfil"),
                     fechar_rota=route_state.get("fechar_rota", False),
+                    ponto_partida=route_state.get("partida"),
+                    ponto_destino=route_state.get("destino"),
                 )
-
                 st.download_button(
                     "⬇️ Baixar GeoJSON da rota",
                     data=geojson_str.encode("utf-8"),
                     file_name="rota_clientes.geojson",
                     mime="application/geo+json",
                 )
+            except Exception as e:
+                st.error(f"Não foi possível gerar o GeoJSON: {e}")
+
+            # Downloads: KML e KMZ
+            try:
+                kml_str = montar_kml_rota(
+                    route_coords_lonlat=route_state["coords_lonlat"],
+                    pontos_ordem_df=ordem_df,
+                    distancia_km=route_state.get("distancia_km"),
+                    duracao_min=route_state.get("duracao_min"),
+                    profile=route_state.get("perfil"),
+                    fechar_rota=route_state.get("fechar_rota", False),
+                    ponto_partida=route_state.get("partida"),
+                    ponto_destino=route_state.get("destino"),
+                )
+
+                st.download_button(
+                    "⬇️ Baixar KML da rota",
+                    data=kml_str.encode("utf-8"),
+                    file_name="rota_clientes.kml",
+                    mime="application/vnd.google-earth.kml+xml",
+                )
+
+                # KMZ (zip contendo doc.kml)
+                kml_bytes = kml_str.encode("utf-8")
+                kmz_buffer = io.BytesIO()
+                with zipfile.ZipFile(kmz_buffer, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+                    zf.writestr("doc.kml", kml_bytes)
+                kmz_data = kmz_buffer.getvalue()
+
+                st.download_button(
+                    "⬇️ Baixar KMZ da rota",
+                    data=kmz_data,
+                    file_name="rota_clientes.kmz",
+                    mime="application/vnd.google-earth.kmz",
+                )
 
                 with st.expander("Prévia do GeoJSON (até ~2000 chars)"):
                     st.code(geojson_str[:2000], language="json")
+
             except Exception as e:
-                st.error(f"Não foi possível gerar o GeoJSON: {e}")
+                st.error(f"Não foi possível gerar KML/KMZ: {e}")
         else:
             # Sem rota gerada, apenas mostra os pontos geocodificados
             mostrar_mapa(df_geo)
